@@ -1,0 +1,14 @@
+{
+  "name": "com.renderloom.hism",
+  "description": "Hierarchical Instanced Static Mesh component in SRP (BRG)",
+  "version": "1.0.0",
+  "unity": "2022.3",
+  "unityRelease": "20f1",
+  "displayName": "HISM",
+  "dependencies": {
+    "com.unity.burst": "1.8.19",
+    "com.unity.mathematics": "1.3.2",
+    "com.unity.collections": "2.5.7"
+  },
+  "type": "library"
+}
