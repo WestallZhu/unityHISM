@@ -1,3 +1,5 @@
+
+using Renderloom.Rendering;
 using System;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
@@ -9,9 +11,8 @@ using Unity.Mathematics;
 using UnityEngine;
 using UnityEngine.Assertions;
 using UnityEngine.Rendering;
-using Renderloom.Rendering;
+using Renderloom.HISM.Streaming;
 using FrustumPlanes = Renderloom.Rendering.FrustumPlanes;
-using LODGroupExtensions = Renderloom.Rendering.LODGroupExtensions;
 
 namespace Renderloom.HISM
 {
@@ -61,29 +62,6 @@ namespace Renderloom.HISM
         public short SizeBytesGPU;
     }
 
-    public unsafe struct BlobArray<T> where T : unmanaged
-    {
-        internal int m_OffsetPtr;
-        internal int m_Length;
-
-        public int Length => m_Length;
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public void* GetUnsafePtr()
-        {
-            fixed (int* thisPtr = &m_OffsetPtr)
-            {
-                return (byte*)thisPtr + m_OffsetPtr;
-            }
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public UnsafeList<T> AsUnsafeList()
-        {
-            return new UnsafeList<T>((T*)GetUnsafePtr(), m_Length);
-        }
-    }
-
     public static class TypeId<T>
     {
         public static readonly int Value = typeof(T) switch
@@ -94,16 +72,6 @@ namespace Renderloom.HISM
             var t when t == typeof(float4) => 3,
             _ => -1
         };
-    }
-
-    public unsafe struct HISMChunkIn
-    {
-        public int Archetype;
-        public AABB BoundingBox;
-        public BlobArray<HISMNode> BVHTree; // = BVHNode*
-        public BlobArray<MaterialPropertyType> MaterialProperties;
-        public BlobArray<HISMPrimitive> Primitives; // = Primitive*
-        public BlobArray<byte> data; // SoA fixed-size property stream (concatenated in overrides order)
     }
 
     public unsafe struct HIMRRenderArray
@@ -231,10 +199,10 @@ namespace Renderloom.HISM
     {
         [ReadOnly] public LODGroupExtensions.LODParams LODParams;
         [ReadOnly] public NativeArray<FrustumPlanes.PlanePacket4> Packet4;
-        [ReadOnly] public NativeArray<HISMChunkIn> Chunks;
+        [ReadOnly] public NativeArray<HISMChunk> Chunks;
 
         public NativeStream.Writer Writer;
-        public float4 LodThresholdSq; // provided by caller
+        public float4 LodThresholdSq; 
 
         public void Execute(int i)
         {
@@ -296,7 +264,7 @@ namespace Renderloom.HISM
             }
 
             var nodes = (HISMNode*)chunk.BVHTree.GetUnsafePtr();
-            int* stack = stackalloc int[128]; int sp = 0; stack[sp++] = 0; // root (larger stack to avoid worst-case overflow)
+            int* stack = stackalloc int[128]; int sp = 0; stack[sp++] = 0; // root
 
             Writer.BeginForEachIndex(i);
             while (sp > 0)
@@ -425,7 +393,7 @@ namespace Renderloom.HISM
     [BurstCompile]
     public unsafe struct HISMCountRunsJob : IJobParallelFor
     {
-        [ReadOnly] public NativeArray<HISMChunkIn> Chunks;
+        [ReadOnly] public NativeArray<HISMChunk> Chunks;
         [ReadOnly] public NativeArray<ChunkRuntime> ChunkRuntimes;
         [ReadOnly] public NativeStream.Reader Reader;
 
@@ -552,7 +520,7 @@ namespace Renderloom.HISM
                 Out->drawCommands = null;
             }
 
-            // basic range (Unity 2022.3 has no drawCommandsType)
+       
             if (Out->drawRangeCount > 0)
             {
                 Out->drawRanges[0].drawCommandsBegin = 0;
@@ -569,7 +537,7 @@ namespace Renderloom.HISM
     [BurstCompile]
     public unsafe struct HISMEmitWriteJob : IJobParallelFor
     {
-        [ReadOnly] public NativeArray<HISMChunkIn> Chunks;
+        [ReadOnly] public NativeArray<HISMChunk> Chunks;
         [ReadOnly] public NativeArray<ChunkRuntime> ChunkRuntimes;
         [ReadOnly] public NativeStream.Reader Reader;
 
@@ -600,7 +568,7 @@ namespace Renderloom.HISM
             int cmdBase = CmdOffsets[ci];
             int visBase = VisOffsets[ci];
 
-            var reader = Reader; // struct copy
+            var reader = Reader;
             int n = reader.BeginForEachIndex(ci);
 
             var chunk = Chunks[ci];
@@ -719,7 +687,7 @@ namespace Renderloom.HISM
         public int PrevSameArch;
     }
 
-    unsafe class HISMSystem : IDisposable
+    unsafe class HISMSystem : IDisposable, IHISMBackend
     {
         private const int kMaxCbufferSize = 64 * 1024;
         internal static readonly bool UseConstantBuffers = BatchRendererGroup.BufferTarget == BatchBufferTarget.ConstantBuffer;
@@ -747,15 +715,19 @@ namespace Renderloom.HISM
         private GraphicsBuffer m_GPUPersistentInstanceData;
         private GraphicsBufferHandle m_GPUPersistentInstanceBufferHandle;
 
-        private NativeList<HISMChunkIn> m_Chunks;
-        private NativeList<HISMChunkIn> m_NewChunks;
+        private NativeList<HISMChunk> m_Chunks;
+        private NativeList<HISMChunk> m_NewChunks;
 
-        // Added: runtime map per chunk (batch index + offset within batch)
+        // ‘À–– ±”≥…‰
         private NativeList<ChunkRuntime> m_ChunkRuntime;
-        // Added: per-chunk SubBatch index (for O(1) removal)
         private NativeList<int> m_ChunkSubBatchID;
 
-        // Render mapping (Mesh/Material list)
+        // æ‰±˙”≥…‰
+        private NativeParallelHashMap<ulong, int> m_HandleToChunkIndex;
+        private NativeList<ulong> m_ChunkHandle;
+        private ulong m_NextHandle;
+
+        // ‰÷»æ”≥…‰
         private HIMRRenderArray m_RenderArray;
 
         static NativeParallelMultiHashMap<int, MaterialPropertyType> s_NameIDToMaterialProperties;
@@ -802,7 +774,6 @@ namespace Renderloom.HISM
             m_SystemMemoryBuffer = new NativeArray<float4>((int)m_PersistentInstanceDataSize / 16, Allocator.Persistent, NativeArrayOptions.ClearMemory);
 
             s_NameIDToMaterialProperties = new NativeParallelMultiHashMap<int, MaterialPropertyType>(16, Allocator.Persistent);
-            // equal-size registration: CPU/GPU size match
             RegisterMaterialPropertyType<float4x4>("unity_ObjectToWorld");
 
             m_MaxBatchIdPlusOne = 0;
@@ -810,24 +781,25 @@ namespace Renderloom.HISM
             m_BatchInfos = new NativeList<BatchInfo>(kInitialMaxBatchCount, Allocator.Persistent);
             m_BatchInfos.Resize(1, NativeArrayOptions.ClearMemory);
 
-            m_Chunks = new NativeList<HISMChunkIn>(Allocator.Persistent);
-            m_NewChunks = new NativeList<HISMChunkIn>(Allocator.Persistent);
+            m_Chunks = new NativeList<HISMChunk>(Allocator.Persistent);
+            m_NewChunks = new NativeList<HISMChunk>(Allocator.Persistent);
 
-            // Added: chunk runtime mapping + SubBatchID table
             m_ChunkRuntime = new NativeList<ChunkRuntime>(Allocator.Persistent);
             m_ChunkSubBatchID = new NativeList<int>(Allocator.Persistent);
 
-            // Render mapping (Mesh/Material list)
+            m_HandleToChunkIndex = new NativeParallelHashMap<ulong, int>(128, Allocator.Persistent);
+            m_ChunkHandle = new NativeList<ulong>(Allocator.Persistent);
+            m_NextHandle = 1;
+
             m_RenderArray = new HIMRRenderArray();
             m_RenderArray.Init(m_BatchRendererGroup);
             m_RenderArray._meshMaterialList = new UnsafeList<MeshMaterialNode>(0, Allocator.Persistent);
             m_RenderArray._rendererHashMap = new NativeHashMap<uint, MeshMaterialIndexCount>(128, Allocator.Persistent);
         }
 
-        public static void RegisterMaterialPropertyType<T>(string propertyName, short overrideTypeSizeGPU = -1)
+        public static void RegisterMaterialPropertyType<T>(string propertyName, short overrideTypeSizeGPU = -1) where T : struct
         {
-            Type type = typeof(T);
-            short typeSizeCPU = (short)UnsafeUtility.SizeOf(type);
+            short typeSizeCPU = (short)UnsafeUtility.SizeOf<T>();
             if (overrideTypeSizeGPU == -1)
                 overrideTypeSizeGPU = typeSizeCPU;
 
@@ -843,8 +815,43 @@ namespace Renderloom.HISM
             s_NameIDToMaterialProperties.Add(nameID, materialPropertyType);
         }
 
+        // IHISMBackend °™°™ º”‘ÿ/–∂‘ÿ
+        public ulong OnChunkLoaded(ref HISMChunk chunk, IntPtr bufferBase, int byteSize)
+        {
+            if (!AddChunk(ref chunk))
+                return 0UL;
+
+            int newIndex = m_Chunks.Length - 1;
+            ulong handle = m_NextHandle++;
+            m_HandleToChunkIndex[handle] = newIndex;
+            m_ChunkHandle.Add(handle);
+            return handle;
+        }
+
+        public void OnChunkUnloaded(ulong handle)
+        {
+            if (!m_HandleToChunkIndex.TryGetValue(handle, out int idx))
+                return;
+
+            m_HandleToChunkIndex.Remove(handle);
+
+            int last = m_Chunks.Length - 1;
+            ulong lastHandle = last >= 0 ? m_ChunkHandle[last] : 0UL;
+
+            RemoveChunk(idx);
+
+            if (idx != last)
+            {
+                m_HandleToChunkIndex[lastHandle] = idx;
+                m_ChunkHandle[idx] = lastHandle;
+            }
+
+            if (last >= 0)
+                m_ChunkHandle.Resize(last, NativeArrayOptions.UninitializedMemory);
+        }
+
         // Entry point: add a chunk (upload to GPU, assign batch, record runtime map)
-        public bool AddChunk(HISMChunkIn chunk)
+        public bool AddChunk(ref HISMChunk chunk)
         {
             int graphicsArchetypeIndex = chunk.Archetype;
             int numInstances = chunk.Primitives.Length;
@@ -1024,7 +1031,7 @@ namespace Renderloom.HISM
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private void UploadChunkStreamsToGPU_EqualSize(
-            ref HISMChunkIn chunk,
+            ref HISMChunk chunk,
             UnsafeList<MaterialPropertyType> overrides,
             NativeArray<int> streamBegin,
             int chunkOffsetInBatch)
@@ -1052,7 +1059,7 @@ namespace Renderloom.HISM
         }
 
         // Create new batch: returns batchIndex / chunkOffsetInBatch / subBatchIndex
-        bool AddNewBatch(ref HISMChunkIn chunk, out int outBatchIndex, out int outChunkOffsetInBatch, out int outSubBatchIndex)
+        bool AddNewBatch(ref HISMChunk chunk, out int outBatchIndex, out int outChunkOffsetInBatch, out int outSubBatchIndex)
         {
             outBatchIndex = -1;
             outChunkOffsetInBatch = -1;
@@ -1233,7 +1240,7 @@ namespace Renderloom.HISM
         }
 
         // Reuse existing batch: returns outChunkOffsetInBatch and outSubBatchIndex
-        private bool AddSubBatchToExistingBatch(ref HISMChunkIn chunk,
+        private bool AddSubBatchToExistingBatch(ref HISMChunk chunk,
                                                 int batchIndex,
                                                 int subBatchIndex,
                                                 int offset,
@@ -1251,7 +1258,6 @@ namespace Renderloom.HISM
             int numProperties = overrides.Length;
             int batchTotalChunkMetadata = numProperties;
 
-            // boundary and state checks
             int maxEntitiesPerBatch = maxPerBatch;
             if (offset < 0 || numInstances <= 0 || offset + numInstances > maxEntitiesPerBatch)
             {
@@ -1622,9 +1628,12 @@ namespace Renderloom.HISM
 
             m_ChunkMetadataAllocator.Dispose();
 
-            // release render mapping (if allocated here)
+            
             if (m_RenderArray._rendererHashMap.IsCreated) m_RenderArray._rendererHashMap.Dispose();
             if (m_RenderArray._meshMaterialList.Ptr != null) m_RenderArray._meshMaterialList.Dispose();
+
+            if (m_HandleToChunkIndex.IsCreated) m_HandleToChunkIndex.Dispose();
+            if (m_ChunkHandle.IsCreated) m_ChunkHandle.Dispose();
         }
     }
 }
