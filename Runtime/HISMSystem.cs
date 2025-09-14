@@ -20,7 +20,8 @@ namespace Renderloom.HISM
     public struct HISMPrimitive
     {
         public AABB BoundingBox;
-        public MeshMaterialIndexCount meshMaterialLods; // index + count (LOD entries)
+        // mmIdx = chunkBase + index + lod.
+        public MeshMaterialIndexCount meshMaterialLods;
         // public int submeshIndex;
     }
 
@@ -42,7 +43,7 @@ namespace Renderloom.HISM
 
     public struct MeshMaterialIndexCount
     {
-        public int index; // start index of MeshMaterialNode linear array
+        public int index; // start index (base) in MeshMaterialNode linear array
         public int count; // LOD count
     }
 
@@ -74,27 +75,19 @@ namespace Renderloom.HISM
         };
     }
 
+    /// <summary>
+    /// Each chunk owns its LOD ‚Üí (mesh, material) mapping; no cross-chunk reuse.
+    /// Batching relies on BRG: registering the same Mesh/Material yields the same BatchMeshID/BatchMaterialID.
+    /// </summary>
     public unsafe struct HIMRRenderArray
     {
-        static uint RenderHash(List<Material> matList, List<Mesh> meshList)
-        {
-            uint hash = 17;
-            for (int i = 0; i < matList.Count; i++)
-            {
-                hash = hash * 31 + (uint)matList[i].GetInstanceID();
-                hash = hash * 31 + (uint)meshList[i].GetInstanceID();
-            }
-            return hash;
-        }
-
         const int MaxLod = 4;
+
         public UnsafeList<MeshMaterialNode> _meshMaterialList;
         fixed int _freeNode[MaxLod];
 
         int _freeNodeCount;
         int _allocatedCount;
-
-        public NativeHashMap<uint, MeshMaterialIndexCount> _rendererHashMap;
 
         private BatchRendererGroup _batchRendererGroup;
 
@@ -108,35 +101,22 @@ namespace Renderloom.HISM
             _batchRendererGroup = brg;
         }
 
-        public MeshMaterialIndexCount GetOrCreateRender(List<Material> matList, List<Mesh> meshList)
+        /// <summary>
+        /// Create a contiguous MeshMaterialNode range for the chunk's LOD table (materials/meshes).
+        /// No caching/reuse; returns {base, count}.
+        /// </summary>
+        public MeshMaterialIndexCount CreateRender(List<Material> matList, List<Mesh> meshList)
         {
-            uint hash = RenderHash(matList, meshList);
+            int count = matList.Count;
+            var renderer = AllocateRender(count);
 
-            if (!_rendererHashMap.TryGetValue(hash, out var renderer))
+            MeshMaterialNode* p = _meshMaterialList.Ptr;
+            for (int i = 0; i < count; i++)
             {
-                renderer = AllocateRender(matList.Count);
-                _rendererHashMap[hash] = renderer;
-
-                MeshMaterialNode* p = _meshMaterialList.Ptr;
-                for (int i = renderer.index; i < renderer.index + renderer.count; i++)
-                {
-                    p[i].batchMeshID = _batchRendererGroup.RegisterMesh(meshList[i]);
-                    p[i].batchMaterialID = _batchRendererGroup.RegisterMaterial(matList[i]);
-                }
+                p[renderer.index + i].batchMeshID = _batchRendererGroup.RegisterMesh(meshList[i]);
+                p[renderer.index + i].batchMaterialID = _batchRendererGroup.RegisterMaterial(matList[i]);
             }
-
             return renderer;
-        }
-
-        public bool GetRender(uint hash, ref MeshMaterialIndexCount renderer)
-        {
-            bool ret = _rendererHashMap.TryGetValue(hash, out renderer);
-            if (!ret)
-            {
-                renderer.count = 0;
-                renderer.index = -1;
-            }
-            return ret;
         }
 
         MeshMaterialIndexCount AllocateRender(int count)
@@ -154,11 +134,13 @@ namespace Renderloom.HISM
                 _meshMaterialList.Resize(index + count);
             }
             _allocatedCount += count;
-
             return new MeshMaterialIndexCount { index = index, count = count };
         }
 
-        void FreeRender(ref MeshMaterialIndexCount renderer)
+        /// <summary>
+        /// Unregister and return nodes to the free list bucketed by LOD count.
+        /// </summary>
+        public void FreeRender(ref MeshMaterialIndexCount renderer)
         {
             int index = renderer.index;
             int count = renderer.count;
@@ -166,7 +148,7 @@ namespace Renderloom.HISM
             if (index < 0 || count <= 0)
                 return;
 
-            for (int i = renderer.index; i < renderer.index + renderer.count; i++)
+            for (int i = index; i < index + count; i++)
             {
                 _batchRendererGroup.UnregisterMesh(_meshMaterialList[i].batchMeshID);
                 _batchRendererGroup.UnregisterMaterial(_meshMaterialList[i].batchMaterialID);
@@ -186,7 +168,7 @@ namespace Renderloom.HISM
     internal struct VisibleCmd
     {
         public int lod;
-        public int rendererIndex; // Reserved: set during Emit
+        public int rendererIndex; // Reserved: set during Emit (not used now)
         public int first;
         public int count;
         public int chunkIndex;
@@ -213,7 +195,7 @@ namespace Renderloom.HISM
             bool chunkSingleLod = TryWholeBoxSingleLod_Sq(chunk.BoundingBox, LODParams.cameraPos, LodThresholdSq, out int chunkLod);
 
             int primitiveLength = chunk.Primitives.Length;
-            var primitives = (HISMPrimitive*)chunk.Primitives.GetUnsafePtr();
+            var primitives = (HISMPrimitive*)chunk.Primitives.Ptr;
 
             if (state == FrustumPlanes.IntersectResult.In && chunkSingleLod)
             {
@@ -263,7 +245,7 @@ namespace Renderloom.HISM
                 return;
             }
 
-            var nodes = (HISMNode*)chunk.BVHTree.GetUnsafePtr();
+            var nodes = (HISMNode*)chunk.BVHTree.Ptr;
             int* stack = stackalloc int[128]; int sp = 0; stack[sp++] = 0; // root
 
             Writer.BeginForEachIndex(i);
@@ -396,6 +378,7 @@ namespace Renderloom.HISM
         [ReadOnly] public NativeArray<HISMChunk> Chunks;
         [ReadOnly] public NativeArray<ChunkRuntime> ChunkRuntimes;
         [ReadOnly] public NativeStream.Reader Reader;
+        [ReadOnly] public NativeArray<MeshMaterialIndexCount> ChunkMMIC; // chunk-level LOD base (in _meshMaterialList)
 
         public NativeArray<int> RunCounts;     // per-chunk command count (merged by renderer)
         public NativeArray<int> VisibleCounts; // per-chunk visible instance count
@@ -410,8 +393,9 @@ namespace Renderloom.HISM
             int n = reader.BeginForEachIndex(ci);
 
             var chunk = Chunks[ci];
-            var prims = (HISMPrimitive*)chunk.Primitives.GetUnsafePtr();
+            var prims = (HISMPrimitive*)chunk.Primitives.Ptr;
             int batchIndex = ChunkRuntimes[ci].BatchIndex;
+            int baseIx = ChunkMMIC[ci].index; // chunk-level base
 
             int runCount = 0;
             int visCount = 0;
@@ -429,8 +413,9 @@ namespace Renderloom.HISM
                 {
                     visCount++;
 
-                    var mm = prims[j].meshMaterialLods;
-                    int mmIdx = mm.index + ClampLod(mm, v.lod);
+                    var mmRel = prims[j].meshMaterialLods; // relative range inside chunk LOD table
+                    int lod = ClampLod(mmRel, v.lod);
+                    int mmIdx = baseIx + mmRel.index + lod; // absolute index in _meshMaterialList
 
                     if (!havePrev || mmIdx != prevMM || batchIndex != prevBatch)
                     {
@@ -520,7 +505,6 @@ namespace Renderloom.HISM
                 Out->drawCommands = null;
             }
 
-       
             if (Out->drawRangeCount > 0)
             {
                 Out->drawRanges[0].drawCommandsBegin = 0;
@@ -545,6 +529,7 @@ namespace Renderloom.HISM
         [ReadOnly] public NativeArray<int> VisOffsets;   // exclusive
         [ReadOnly] public NativeArray<int> RunCounts;    // for bounds
         [ReadOnly] public NativeArray<int> VisibleCounts;
+        [ReadOnly] public NativeArray<MeshMaterialIndexCount> ChunkMMIC; // chunk-level base
 
         [NativeDisableUnsafePtrRestriction] public BatchCullingOutputDrawCommands* Out;
         [NativeDisableUnsafePtrRestriction] public MeshMaterialNode* MeshMaterials;
@@ -572,10 +557,11 @@ namespace Renderloom.HISM
             int n = reader.BeginForEachIndex(ci);
 
             var chunk = Chunks[ci];
-            var prims = (HISMPrimitive*)chunk.Primitives.GetUnsafePtr();
+            var prims = (HISMPrimitive*)chunk.Primitives.Ptr;
 
             var rt = ChunkRuntimes[ci];
             var batchID = new BatchID { value = (uint)rt.BatchIndex };
+            int baseIx = ChunkMMIC[ci].index; // chunk-level LOD base
 
             // write cursors
             int cmdW = cmdBase;
@@ -594,8 +580,9 @@ namespace Renderloom.HISM
 
                 for (int j = v.first; j < end; ++j)
                 {
-                    var mm = prims[j].meshMaterialLods;
-                    int mmIdx = mm.index + ClampLod(mm, v.lod);
+                    var mmRel = prims[j].meshMaterialLods; // relative range
+                    int lod = ClampLod(mmRel, v.lod);
+                    int mmIdx = baseIx + mmRel.index + lod;
 
                     // flush on state change
                     if (!haveRun || mmIdx != curMMIdx || rt.BatchIndex != curBatchIdx)
@@ -687,7 +674,13 @@ namespace Renderloom.HISM
         public int PrevSameArch;
     }
 
-    unsafe class HISMSystem : IDisposable, IHISMBackend
+    /// <summary>
+    /// Implements IHISMBackend:
+    /// - OnChunkLoaded: create renderer (CreateRender) for the chunk's LOD table and record chunk-level MMIC.
+    /// - Emit phase: compute mmIdx = chunkBase + relativeRange.index + lod; no per-instance write-back.
+    /// - OnChunkUnloaded/RemoveChunk: unregister using chunk MMIC, free SubBatch/Batch, keep arrays tightly packed in O(1).
+    /// </summary>
+    unsafe class HISMSystem : IDisposable, IHISMSystemLike
     {
         private const int kMaxCbufferSize = 64 * 1024;
         internal static readonly bool UseConstantBuffers = BatchRendererGroup.BufferTarget == BatchBufferTarget.ConstantBuffer;
@@ -718,16 +711,19 @@ namespace Renderloom.HISM
         private NativeList<HISMChunk> m_Chunks;
         private NativeList<HISMChunk> m_NewChunks;
 
-        // ‘À–– ±”≥…‰
+        // Runtime mapping
         private NativeList<ChunkRuntime> m_ChunkRuntime;
         private NativeList<int> m_ChunkSubBatchID;
 
-        // æ‰±˙”≥…‰
+        // Per-chunk LOD table in _meshMaterialList as {base, count}
+        private NativeList<MeshMaterialIndexCount> m_ChunkMMIC;
+
+        // Handle mapping
         private NativeParallelHashMap<ulong, int> m_HandleToChunkIndex;
         private NativeList<ulong> m_ChunkHandle;
         private ulong m_NextHandle;
 
-        // ‰÷»æ”≥…‰
+        // Rendering mapping
         private HIMRRenderArray m_RenderArray;
 
         static NativeParallelMultiHashMap<int, MaterialPropertyType> s_NameIDToMaterialProperties;
@@ -786,6 +782,7 @@ namespace Renderloom.HISM
 
             m_ChunkRuntime = new NativeList<ChunkRuntime>(Allocator.Persistent);
             m_ChunkSubBatchID = new NativeList<int>(Allocator.Persistent);
+            m_ChunkMMIC = new NativeList<MeshMaterialIndexCount>(Allocator.Persistent);
 
             m_HandleToChunkIndex = new NativeParallelHashMap<ulong, int>(128, Allocator.Persistent);
             m_ChunkHandle = new NativeList<ulong>(Allocator.Persistent);
@@ -794,7 +791,6 @@ namespace Renderloom.HISM
             m_RenderArray = new HIMRRenderArray();
             m_RenderArray.Init(m_BatchRendererGroup);
             m_RenderArray._meshMaterialList = new UnsafeList<MeshMaterialNode>(0, Allocator.Persistent);
-            m_RenderArray._rendererHashMap = new NativeHashMap<uint, MeshMaterialIndexCount>(128, Allocator.Persistent);
         }
 
         public static void RegisterMaterialPropertyType<T>(string propertyName, short overrideTypeSizeGPU = -1) where T : struct
@@ -815,12 +811,23 @@ namespace Renderloom.HISM
             s_NameIDToMaterialProperties.Add(nameID, materialPropertyType);
         }
 
-        // IHISMBackend °™°™ º”‘ÿ/–∂‘ÿ
-        public ulong OnChunkLoaded(ref HISMChunk chunk, IntPtr bufferBase, int byteSize)
+        // IHISMBackend - Load/Unload (no per-instance writes; create renderer from chunk-level LOD table and record base)
+        public ulong OnChunkLoaded(ref HISMChunk chunk, IntPtr bufferBase, int byteSize,
+                                   List<Material> materials, List<Mesh> meshes)
         {
+            // 1) Create renderer for the chunk-local LOD table; get {base, count}
+            MeshMaterialIndexCount mmicChunk = m_RenderArray.CreateRender(materials, meshes);
+
+            // 2) Do not modify any instances (meshMaterialLods is a relative range); during Emit compute absolute index as base + relative + lod
+
+            // 3) Upload and add to batch
             if (!AddChunk(ref chunk))
                 return 0UL;
 
+            // 4) Record chunk-level MMIC aligned with m_Chunks
+            m_ChunkMMIC.Add(mmicChunk);
+
+            // 5) Generate unload handle
             int newIndex = m_Chunks.Length - 1;
             ulong handle = m_NextHandle++;
             m_HandleToChunkIndex[handle] = newIndex;
@@ -856,7 +863,7 @@ namespace Renderloom.HISM
             int graphicsArchetypeIndex = chunk.Archetype;
             int numInstances = chunk.Primitives.Length;
 
-            var overrides = chunk.MaterialProperties.AsUnsafeList();
+            var overrides = chunk.MaterialProperties; // UnsafeList<MaterialPropertyType>
             int maxPerBatch = MaxsPerCBufferBatch(overrides);
 
             var (existingBatchIndex, reservedSub, offset) =
@@ -935,7 +942,8 @@ namespace Renderloom.HISM
                 ChunkRuntimes = m_ChunkRuntime.AsArray(),
                 Reader = stream.AsReader(),
                 RunCounts = runCounts,
-                VisibleCounts = visCounts
+                VisibleCounts = visCounts,
+                ChunkMMIC = m_ChunkMMIC.AsArray() // NEW
             }.Schedule(chunkCount, 1, cullJob);
 
             // 3) exclusive prefix sums for per-chunk write offsets
@@ -974,7 +982,8 @@ namespace Renderloom.HISM
                     VisibleCounts = visCounts,
                     Out = outPtr,
                     MeshMaterials = m_RenderArray._meshMaterialList.Ptr,
-                    MeshMaterialsLength = m_RenderArray._meshMaterialList.Length
+                    MeshMaterialsLength = m_RenderArray._meshMaterialList.Length,
+                    ChunkMMIC = m_ChunkMMIC.AsArray() // NEW
                 }.Schedule(chunkCount, 1, allocJob);
 
                 // 6) cross-chunk adjacent command merge (in-place compact)
@@ -1037,7 +1046,7 @@ namespace Renderloom.HISM
             int chunkOffsetInBatch)
         {
             int numInstances = chunk.Primitives.Length;
-            var chunkData = chunk.data.AsUnsafeList();
+            UnsafeList<byte> chunkData = chunk.data;
 
             byte* sysPtr = (byte*)m_SystemMemoryBuffer.GetUnsafePtr();
             int srcOffset = 0;
@@ -1068,7 +1077,7 @@ namespace Renderloom.HISM
             int graphicsArchetypeIndex = chunk.Archetype;
             int numInstances = chunk.Primitives.Length;
 
-            var overrides = chunk.MaterialProperties.AsUnsafeList();
+            UnsafeList<MaterialPropertyType> overrides = chunk.MaterialProperties;
             int maxPerBatch = MaxsPerCBufferBatch(overrides);
 
             var overrideSizes = new NativeArray<int>(overrides.Length, Allocator.Temp);
@@ -1254,7 +1263,7 @@ namespace Renderloom.HISM
 
             int graphicsArchetypeIndex = chunk.Archetype;
 
-            var overrides = chunk.MaterialProperties.AsUnsafeList();
+            UnsafeList<MaterialPropertyType> overrides = chunk.MaterialProperties;
             int numProperties = overrides.Length;
             int batchTotalChunkMetadata = numProperties;
 
@@ -1527,24 +1536,29 @@ namespace Renderloom.HISM
             if (!m_Chunks.IsCreated || chunkIndex < 0 || chunkIndex >= m_Chunks.Length)
                 return false;
 
-            int subBatchIndex = m_ChunkSubBatchID[chunkIndex];
+            // First release the chunk-level renderer (unregister + return to free list)
+            var mmic = m_ChunkMMIC[chunkIndex];
+            m_RenderArray.FreeRender(ref mmic);
 
-            // free this chunk's SubBatch (reclaims GPU blocks, chunk metadata, list nodes; auto-removes batch if empty)
+            // Release rendering-side resources (including SubBatch/Batch) and perform swap-back
+            int subBatchIndex = m_ChunkSubBatchID[chunkIndex];
             RemoveSubBatch(subBatchIndex);
 
-            // compact the three parallel arrays (swap-back)
+            // compact the parallel arrays (swap-back)
             int last = m_Chunks.Length - 1;
             if (chunkIndex != last)
             {
                 m_Chunks[chunkIndex] = m_Chunks[last];
                 m_ChunkRuntime[chunkIndex] = m_ChunkRuntime[last];
                 m_ChunkSubBatchID[chunkIndex] = m_ChunkSubBatchID[last];
+                m_ChunkMMIC[chunkIndex] = m_ChunkMMIC[last];
             }
 
             // shrink lengths
             m_Chunks.Resize(last, NativeArrayOptions.UninitializedMemory);
             m_ChunkRuntime.Resize(last, NativeArrayOptions.UninitializedMemory);
             m_ChunkSubBatchID.Resize(last, NativeArrayOptions.UninitializedMemory);
+            m_ChunkMMIC.Resize(last, NativeArrayOptions.UninitializedMemory);
 
             return true;
         }
@@ -1615,6 +1629,7 @@ namespace Renderloom.HISM
             if (m_NewChunks.IsCreated) m_NewChunks.Dispose();
             if (m_ChunkRuntime.IsCreated) m_ChunkRuntime.Dispose();
             if (m_ChunkSubBatchID.IsCreated) m_ChunkSubBatchID.Dispose();
+            if (m_ChunkMMIC.IsCreated) m_ChunkMMIC.Dispose();
 
             if (m_ArchHead.IsCreated) m_ArchHead.Dispose();
             if (m_ExistingBatchIndices.IsCreated) m_ExistingBatchIndices.Dispose();
@@ -1628,8 +1643,6 @@ namespace Renderloom.HISM
 
             m_ChunkMetadataAllocator.Dispose();
 
-            
-            if (m_RenderArray._rendererHashMap.IsCreated) m_RenderArray._rendererHashMap.Dispose();
             if (m_RenderArray._meshMaterialList.Ptr != null) m_RenderArray._meshMaterialList.Dispose();
 
             if (m_HandleToChunkIndex.IsCreated) m_HandleToChunkIndex.Dispose();

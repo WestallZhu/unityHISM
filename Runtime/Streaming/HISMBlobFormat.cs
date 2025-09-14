@@ -1,7 +1,6 @@
 
-// HISMBlobFormat.cs
-// Self-Relative Blob format: zero-fixup loading using self-relative BlobArray<T>.
-// This matches your requested BlobArray<T> design to simplify serialization & runtime loading.
+// HISMBlobFormat_SR.cs
+// Self-Relative (SR) Blob format: zero-fixup loading using self-relative BlobArray<T>.
 
 #nullable enable
 using System;
@@ -81,19 +80,22 @@ namespace Renderloom.HISM.Streaming
     // Self-Relative HISM Chunk (disk == memory)
     // -----------------------------
     [StructLayout(LayoutKind.Sequential, Pack = 1)]
-    public unsafe struct HISMChunk
+    public unsafe struct HISMChunkMR
     {
-        public uint   Magic;       // 'HCSR' = 0x52534348
+        public uint Magic;       // 'HCSR' = 0x52534348
         public ushort Version;     // 0x0001
-        public ushort Flags;       // reserved
-        public int    Archetype;
-        public AABB   BoundingBox;
+        public ushort Flags;
+        public int Archetype;
+        public AABB BoundingBox;
 
-        public BlobArray<HISMNode>             BVHTree;
+        public BlobArray<HISMNode> BVHTree;
         public BlobArray<MaterialPropertyType> MaterialProperties;
-        public BlobArray<HISMPrimitive>        Primitives;
-        public BlobArray<byte>                 data;        // SoA packed region
-        public BlobArray<HISMAttrDesc>         AttrDescs;   // optional but recommended
+        public BlobArray<HISMPrimitive> Primitives;
+        public BlobArray<byte> data;            // SoA attributes
+        public BlobArray<HISMAttrDesc> AttrDescs;       // optional
+
+        public BlobArray<int> MaterialIndices; // indices -> AssetTable.Materials
+        public BlobArray<int> MeshIndices;     // indices -> AssetTable.Meshes
 
     }
 
